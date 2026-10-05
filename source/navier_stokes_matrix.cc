@@ -901,7 +901,7 @@ adaflo::NavierStokesMatrix<dim>::local_operation(
                 
                 if (parameters.stabilization_navier_stokes == FlowParameters::gls)
                 {
-                  if (dim == 3 || dim == 2)
+                  if constexpr (dim == 3 || dim == 2)
                   {
                     Tensor<3, dim, vector_t> stab_gls; // Initialization?
                     for (unsigned int d = 0; d < dim; ++d)
@@ -910,7 +910,7 @@ adaflo::NavierStokesMatrix<dim>::local_operation(
                     
                     velocity.submit_hessian(stab_gls, q);
                   }
-                  else if (dim == 1)
+                  else if constexpr (dim == 1)
                   {
                     Tensor<2, dim, vector_t> stab_gls; // Initialization?
                     stab_gls[0][0] = - 0.1 * mu * momentum_residual[0];
