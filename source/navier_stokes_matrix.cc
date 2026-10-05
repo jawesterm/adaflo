@@ -104,8 +104,12 @@ adaflo::NavierStokesMatrix<dim>::initialize(const MatrixFree<dim> &matrix_free_i
                                   make_vectorized_array<double>(parameters.viscosity));
       variable_damping_coefficients.resize(size, make_vectorized_array<double>(0));
     }
-  if (parameters.linearization != FlowParameters::coupled_velocity_explicit)
+  if (parameters.linearization != FlowParameters::coupled_velocity_explicit || 
+      parameters.stabilization_navier_stokes != FlowParameters::none)
     linearized_velocities.resize(size);
+  
+  if (parameters.stabilization_navier_stokes != FlowParameters::none)
+    stabilization_residual_components.resize(size);
 
   for (unsigned int mode = 0; mode < 2; ++mode)
     {
@@ -180,6 +184,7 @@ adaflo::NavierStokesMatrix<dim>::clear()
   variable_viscosities.clear();
   variable_damping_coefficients.clear();
   linearized_velocities.clear();
+  stabilization_residual_components.clear();
   variable_densities_preconditioner.clear();
   variable_viscosities_preconditioner.clear();
   variable_damping_coefficients_preconditioner.clear();
@@ -633,6 +638,11 @@ adaflo::NavierStokesMatrix<dim>::local_operation(
       &linearized_velocities[cell_range.first * velocity.n_q_points] :
       0;
 
+  stabilization_residual_stored *stabilization_residual [[maybe_unused]] =
+    stabilization_residual_components.size() > 0 ?
+      &stabilization_residual_components[cell_range.first * velocity.n_q_points] :
+      0;
+
   const bool      use_variable_coefficients = variable_densities.size() > 0;
   const vector_t *rho_values =
     use_variable_coefficients ? begin_densities(cell_range.first) : 0;
@@ -668,7 +678,9 @@ adaflo::NavierStokesMatrix<dim>::local_operation(
       velocity.evaluate(((parameters.physical_type != FlowParameters::stokes) ?
                            EvaluationFlags::values :
                            EvaluationFlags::nothing) |
-                        EvaluationFlags::gradients);
+                        EvaluationFlags::gradients |
+                        ((parameters.stabilization_navier_stokes != FlowParameters::none) ? EvaluationFlags::hessians : 
+                                                                                            EvaluationFlags::nothing));
 
       if (LocalOps == NavierStokesOps::residual &&
           parameters.physical_type == FlowParameters::incompressible)
@@ -693,7 +705,9 @@ adaflo::NavierStokesMatrix<dim>::local_operation(
             get_pressure_values_plain(pressure, src);
           else
             get_pressure_values(pressure, src);
-          pressure.evaluate(EvaluationFlags::values);
+          pressure.evaluate(EvaluationFlags::values | 
+            ((parameters.stabilization_navier_stokes != FlowParameters::none) ? EvaluationFlags::gradients : 
+                                                                                EvaluationFlags::nothing));
         }
 
       // loop over all quadrature points and implement the Navier-Stokes
@@ -704,6 +718,14 @@ adaflo::NavierStokesMatrix<dim>::local_operation(
           Tensor<2, dim, vector_t> grad_u =
             convert_to_tensor<2, dim, vector_t>(velocity.get_gradient(q));
           vector_t divergence = trace(grad_u);
+
+          Tensor<2, dim, vector_t> stab_supg;
+          stab_supg = 0.;
+          
+          // variable parameters if present
+          const vector_t mu = (use_variable_coefficients ?
+                                  mu_values[q] :
+                                  make_vectorized_array<double>(parameters.viscosity));
 
           if (parameters.physical_type != FlowParameters::stokes)
             {
@@ -766,6 +788,8 @@ adaflo::NavierStokesMatrix<dim>::local_operation(
                               res += old_val[e] * old_grad[d][e];
                             conv[d] += tau1 * res;
                           }
+                          if (parameters.stabilization_navier_stokes != FlowParameters::none)
+                            linearized[q].first = old_val;
                       else
                         {
                           for (unsigned int d = 0; d < dim; ++d)
@@ -835,13 +859,70 @@ adaflo::NavierStokesMatrix<dim>::local_operation(
               conv -= damping * val_u;
 
               velocity.submit_value(conv, q);
+
+              // Convection Stabilization
+              if (parameters.stabilization_navier_stokes != FlowParameters::none)
+              { 
+                Tensor<1, dim, vector_t> laplace_u = convert_to_vector<dim, vector_t>(velocity.get_laplacian(q));
+                Tensor<1, dim, vector_t> grad_p;
+                if (LocalOps == NavierStokesOps::residual || LocalOps == NavierStokesOps::vmult)
+                  grad_p = convert_to_vector<dim, vector_t>(pressure.get_gradient(q));
+                else
+                  grad_p = 0.;
+                
+                Tensor<1, dim, vector_t> momentum_residual;
+                for (unsigned int d = 0; d < dim; ++d)
+                  momentum_residual[d] = conv[d] - tau1 * mu * laplace_u[d];
+
+                if (parameters.linearization == FlowParameters::coupled_implicit_newton && 
+                  LocalOps == NavierStokesOps::residual)
+                {
+                  stabilization_residual[q].first = momentum_residual;
+                  stabilization_residual[q].second = grad_p;
+                }
+
+                momentum_residual += grad_p;
+
+                for (unsigned int d = 0; d < dim; ++d)
+                  for (unsigned int e = 0; e < dim; ++e)
+                    stab_supg[d][e] = 0.1 * linearized[q].first[e] * momentum_residual[d];
+
+                if (parameters.linearization == FlowParameters::coupled_implicit_newton && 
+                  LocalOps != NavierStokesOps::residual)
+                {
+                  Tensor<1, dim, vector_t> previous_momentum_residual = stabilization_residual[q].first;
+                  if (LocalOps == NavierStokesOps::vmult)
+                    previous_momentum_residual += stabilization_residual[q].second;
+
+                  for (unsigned int d = 0; d < dim; ++d)
+                    for (unsigned int e = 0; e < dim; ++e)
+                      stab_supg[d][e] += 0.1 * val_u[e] * previous_momentum_residual[d];
+                }
+                
+                if (parameters.stabilization_navier_stokes == FlowParameters::gls)
+                {
+                  if (dim == 3 || dim == 2)
+                  {
+                    Tensor<3, dim, vector_t> stab_gls; // Initialization?
+                    for (unsigned int d = 0; d < dim; ++d)
+                      for (unsigned int e = 0; e < dim; ++e)
+                        stab_gls[d][e][e] = - 0.1 * mu * momentum_residual[d];
+                    
+                    velocity.submit_hessian(stab_gls, q);
+                  }
+                  else if (dim == 1)
+                  {
+                    Tensor<2, dim, vector_t> stab_gls; // Initialization?
+                    stab_gls[0][0] = - 0.1 * mu * momentum_residual[0];
+
+                    velocity.submit_hessian(stab_gls, q);
+                  }
+                }
+              }
             }
 
           // symmetrize gradient and multiply by viscosity
-          const vector_t tmu = (use_variable_coefficients ?
-                                  mu_values[q] :
-                                  make_vectorized_array<double>(parameters.viscosity)) *
-                               tau1;
+          const vector_t tmu = tau1 * mu;
           const vector_t tmu_times_2 = 2. * tmu;
 
           // get divergence, extract pressure, integrate (p, -div (u)), which
@@ -913,6 +994,8 @@ adaflo::NavierStokesMatrix<dim>::local_operation(
           if (LocalOps == NavierStokesOps::vmult || LocalOps == NavierStokesOps::residual)
             for (unsigned int d = 0; d < dim; ++d)
               grad_u[d][d] -= pres;
+          
+          grad_u += stab_supg;
 
           velocity.submit_gradient(grad_u, q);
         }
@@ -922,7 +1005,10 @@ adaflo::NavierStokesMatrix<dim>::local_operation(
       velocity.integrate(((parameters.physical_type != FlowParameters::stokes) ?
                             EvaluationFlags::values :
                             EvaluationFlags::nothing) |
-                         EvaluationFlags::gradients);
+                         EvaluationFlags::gradients |
+                        (parameters.stabilization_navier_stokes == FlowParameters::gls) ?
+                            EvaluationFlags::hessians :
+                            EvaluationFlags::nothing);
       distribute_velocity_ltg(velocity, dst);
       if (LocalOps != NavierStokesOps::vmult_velocity &&
           parameters.linearization != FlowParameters::projection)
@@ -931,6 +1017,7 @@ adaflo::NavierStokesMatrix<dim>::local_operation(
           distribute_pressure_ltg(pressure, dst);
         }
       linearized += velocity.n_q_points;
+      stabilization_residual += velocity.n_q_points;
       if (use_variable_coefficients)
         {
           rho_values += velocity.n_q_points;

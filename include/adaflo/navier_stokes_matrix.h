@@ -54,6 +54,9 @@ namespace adaflo
     typedef std::pair<Tensor<1, dim, VectorizedArray<double>>,
                       Tensor<2, dim, VectorizedArray<double>>>
       velocity_stored;
+    typedef std::pair<Tensor<1, dim, VectorizedArray<double>>,
+                      Tensor<1, dim, VectorizedArray<double>>>
+      stabilization_residual_stored;
     NavierStokesMatrix(
       const FlowParameters                                  &parameters,
       const unsigned int                                    &dof_index_u,
@@ -176,6 +179,8 @@ namespace adaflo
 
     const velocity_stored *
     begin_linearized_velocities(const unsigned int macro_cell) const;
+    const stabilization_residual_stored *
+    begin_stabilization_residual_components(const unsigned int macro_cell) const;
     bool
     use_variable_coefficients() const;
 
@@ -281,6 +286,7 @@ namespace adaflo
     mutable AlignedVector<VectorizedArray<double>> variable_viscosities;
     mutable AlignedVector<VectorizedArray<double>> variable_damping_coefficients;
     mutable AlignedVector<velocity_stored>         linearized_velocities;
+    mutable AlignedVector<stabilization_residual_stored> stabilization_residual_components;
 
     mutable AlignedVector<VectorizedArray<double>> variable_densities_preconditioner;
     mutable AlignedVector<VectorizedArray<double>> variable_viscosities_preconditioner;
@@ -408,6 +414,23 @@ adaflo::NavierStokesMatrix<dim>::begin_linearized_velocities(
                   matrix_free->n_cell_batches() *
                     matrix_free->get_n_q_points(quad_index_u));
   return &linearized_velocities[matrix_free->get_n_q_points(quad_index_u) * macro_cell];
+}
+
+
+
+template <int dim>
+inline const typename adaflo::NavierStokesMatrix<dim>::stabilization_residual_stored *
+adaflo::NavierStokesMatrix<dim>::begin_stabilization_residual_components(
+  const unsigned int macro_cell) const
+{
+  if (stabilization_residual_components.size() == 0)
+    return 0;
+
+  AssertIndexRange(macro_cell, matrix_free->n_cell_batches());
+  AssertDimension(stabilization_residual_components.size(),
+                  matrix_free->n_cell_batches() *
+                    matrix_free->get_n_q_points(quad_index_u));
+  return &stabilization_residual_components[matrix_free->get_n_q_points(quad_index_u) * macro_cell];
 }
 
 #endif

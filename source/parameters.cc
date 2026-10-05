@@ -170,6 +170,10 @@ adaflo::FlowParameters::add_parameters(ParameterHandler &prm)
                     "the solution of linear systems if tau is on the order "
                     "of unity but not too large (as the added term is "
                     "singular).");
+  prm.add_parameter("stabilization navier-stokes",
+                    stabilization_navier_stokes_str,
+                    "...description...",
+                    Patterns::Selection("none|SUPG|GLS"));
 
   prm.add_parameter("lin max iterations",
                     max_lin_iteration,
@@ -462,6 +466,15 @@ adaflo::FlowParameters::post()
                       "stationary equation"));
 
   AssertThrow(tau_grad_div >= 0., ExcMessage("Invalid parameter value"));
+
+  if (stabilization_navier_stokes_str == "none")
+    stabilization_navier_stokes = none;
+  else if (stabilization_navier_stokes_str == "SUPG")
+    stabilization_navier_stokes = supg;
+  else if (stabilization_navier_stokes_str == "GLS")
+    stabilization_navier_stokes = gls;
+  else
+    Assert(false, ExcMessage(("Stabilization " + stabilization_navier_stokes_str + " not available").c_str()));
 
   if (uprec == "ilu")
     precondition_velocity = u_ilu;
