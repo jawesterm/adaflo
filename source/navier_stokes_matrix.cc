@@ -720,7 +720,6 @@ adaflo::NavierStokesMatrix<dim>::local_operation(
           vector_t divergence = trace(grad_u);
 
           Tensor<2, dim, vector_t> stab_supg;
-          stab_supg = 0.;
           
           // variable parameters if present
           const vector_t mu = (use_variable_coefficients ?
@@ -863,19 +862,39 @@ adaflo::NavierStokesMatrix<dim>::local_operation(
               // Convection Stabilization
               if (parameters.stabilization_navier_stokes != FlowParameters::none)
               { 
-                Tensor<1, dim, vector_t> laplace_u = convert_to_vector<dim, vector_t>(velocity.get_laplacian(q));
                 Tensor<1, dim, vector_t> grad_p;
                 if (LocalOps == NavierStokesOps::residual || LocalOps == NavierStokesOps::vmult)
                   grad_p = convert_to_vector<dim, vector_t>(pressure.get_gradient(q));
-                else
-                  grad_p = 0.;
                 
-                Tensor<1, dim, vector_t> momentum_residual;
-                for (unsigned int d = 0; d < dim; ++d)
-                  momentum_residual[d] = conv[d] - tau1 * mu * laplace_u[d];
+                vector_t constitutive_factor;
+                if (parameters.constitutive_type == FlowParameters::newtonian_incompressible)
+                  constitutive_factor = mu;
+                else if (parameters.constitutive_type == FlowParameters::newtonian_compressible_stokes_hypothesis)
+                  constitutive_factor = mu * (1. - 2. / static_cast<double>(dim));
+                else
+                  AssertThrow(false, ExcNotImplemented());
 
-                if (parameters.linearization == FlowParameters::coupled_implicit_newton && 
-                  LocalOps == NavierStokesOps::residual)
+                Tensor<1, dim, vector_t> momentum_residual;
+
+                if constexpr (dim == 3 || dim == 2)
+                {
+                  Tensor<3, dim, vector_t> hessian_u = velocity.get_hessian(q);
+                  for (unsigned int d = 0; d < dim; ++d)
+                  {
+                    momentum_residual[d] = conv[d];
+                    for (unsigned int e = 0; e < dim; ++e)
+                      momentum_residual[d] -= 
+                        tau1 * mu * hessian_u[d][e][e] +
+                        tau1 * constitutive_factor * hessian_u[e][d][e];
+                  }
+                }
+                else if constexpr (dim == 1)
+                {
+                  Tensor<2, dim, vector_t> hessian_u = velocity.get_hessian(q);
+                  momentum_residual[0] = conv[0] - tau1 * (mu + constitutive_factor) * hessian_u[0][0];
+                }
+
+                if (parameters.linearization == FlowParameters::coupled_implicit_newton && LocalOps == NavierStokesOps::residual)
                 {
                   stabilization_residual[q].first = momentum_residual;
                   stabilization_residual[q].second = grad_p;
@@ -903,17 +922,20 @@ adaflo::NavierStokesMatrix<dim>::local_operation(
                 {
                   if constexpr (dim == 3 || dim == 2)
                   {
-                    Tensor<3, dim, vector_t> stab_gls; // Initialization?
+                    Tensor<3, dim, vector_t> stab_gls;
                     for (unsigned int d = 0; d < dim; ++d)
                       for (unsigned int e = 0; e < dim; ++e)
-                        stab_gls[d][e][e] = - 0.1 * mu * momentum_residual[d];
+                      {
+                        stab_gls[d][e][e] -= 0.1 * mu * momentum_residual[d];
+                        stab_gls[e][d][e] -= 0.1 * constitutive_factor * momentum_residual[d];
+                      }
                     
                     velocity.submit_hessian(stab_gls, q);
                   }
                   else if constexpr (dim == 1)
                   {
-                    Tensor<2, dim, vector_t> stab_gls; // Initialization?
-                    stab_gls[0][0] = - 0.1 * mu * momentum_residual[0];
+                    Tensor<2, dim, vector_t> stab_gls;
+                    stab_gls[0][0] = - 0.1 * (mu + constitutive_factor) * momentum_residual[0];
 
                     velocity.submit_hessian(stab_gls, q);
                   }
@@ -1006,9 +1028,9 @@ adaflo::NavierStokesMatrix<dim>::local_operation(
                             EvaluationFlags::values :
                             EvaluationFlags::nothing) |
                          EvaluationFlags::gradients |
-                        (parameters.stabilization_navier_stokes == FlowParameters::gls) ?
+                        ((parameters.stabilization_navier_stokes == FlowParameters::gls) ?
                             EvaluationFlags::hessians :
-                            EvaluationFlags::nothing);
+                            EvaluationFlags::nothing));
       distribute_velocity_ltg(velocity, dst);
       if (LocalOps != NavierStokesOps::vmult_velocity &&
           parameters.linearization != FlowParameters::projection)
