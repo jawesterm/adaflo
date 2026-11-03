@@ -987,6 +987,8 @@ adaflo::NavierStokesPreconditioner<dim>::NavierStokesPreconditioner(
   , dof_handler_u_scalar(tria)
   , parameters(parameters)
   , flow_algorithm(flow_algorithm)
+  , use_stabilization(parameters.convection_stabilization_navier_stokes !=
+                      FlowParameters::none)
 {}
 
 
@@ -1499,11 +1501,13 @@ namespace adaflo::AssemblyData
     FullMatrix<double> pressure_ip_matrix_2;
 
     // temporary matrices that we need to compute the local matrices
-    FullMatrix<double> pressure_laplace_part_matrix;
-    FullMatrix<double> pressure_mass_part_matrix;
-    FullMatrix<double> velocity_matrix_permuted;
-    FullMatrix<double> velocity_phi_matrix;
-    FullMatrix<double> velocity_phi_and_grad_matrix;
+    FullMatrix<double>              pressure_laplace_part_matrix;
+    FullMatrix<double>              pressure_mass_part_matrix;
+    FullMatrix<double>              velocity_matrix_permuted;
+    FullMatrix<double>              velocity_phi_matrix;
+    FullMatrix<double>              velocity_phi_and_grad_matrix;
+    std::vector<FullMatrix<double>> stab_prefactor_matrices;
+    std::vector<FullMatrix<double>> stab_strong_res_matrices;
 
     FEValues<dim> fe_values_lin_u;
     FEValues<dim> fe_values_lin_p;
@@ -1526,7 +1530,8 @@ namespace adaflo::AssemblyData
                     static_cast<const Quadrature<dim> &>(QGauss<dim>(fe_u.degree + 1)) :
                     static_cast<const Quadrature<dim> &>(
                       QGaussSimplex<dim>(fe_u.degree + 1)),
-                  update_values | update_gradients | update_JxW_values)
+                  update_values | update_gradients | update_JxW_values |
+                    (preconditioner.use_stabilization ? update_hessians : update_default))
     , fe_values_p(mapping,
                   fe_p,
                   fe_values_u.get_quadrature(),
@@ -1565,6 +1570,12 @@ namespace adaflo::AssemblyData
                           fe_u.base_element(0).dofs_per_cell)
     , velocity_phi_and_grad_matrix(fe_values_u.n_quadrature_points * (dim + 1),
                                    fe_u.dofs_per_cell)
+    , stab_prefactor_matrices(preconditioner.use_stabilization ? dim : 0,
+                              FullMatrix<double>(fe_values_u.n_quadrature_points,
+                                                 fe_u.base_element(0).dofs_per_cell))
+    , stab_strong_res_matrices(preconditioner.use_stabilization ? dim : 0,
+                               FullMatrix<double>(fe_values_u.n_quadrature_points,
+                                                  fe_u.base_element(0).dofs_per_cell))
     , fe_values_lin_u(mapping,
                       fe_p,
                       *preconditioner.integration_helper.quadrature_sub_u,
@@ -1611,6 +1622,8 @@ namespace adaflo::AssemblyData
     , velocity_matrix_permuted(data.velocity_matrix_permuted)
     , velocity_phi_matrix(data.velocity_phi_matrix)
     , velocity_phi_and_grad_matrix(data.velocity_phi_and_grad_matrix)
+    , stab_prefactor_matrices(data.stab_prefactor_matrices)
+    , stab_strong_res_matrices(data.stab_strong_res_matrices)
     , fe_values_lin_u(data.fe_values_lin_u.get_mapping(),
                       data.fe_values_lin_u.get_fe(),
                       data.fe_values_lin_u.get_quadrature(),
@@ -1753,6 +1766,10 @@ adaflo::NavierStokesPreconditioner<dim>::local_assemble_preconditioner(
   double             data_for_val[n_dofs][n_dofs];
   Tensor<1, dim>     data_for_grad[n_dofs][n_dofs];
 
+  const typename NavierStokesMatrix<dim>::stab_param_stored *stab_param =
+    matrix->begin_stab_param_values(cell_range.first);
+  const bool stabilization = use_stabilization && stab_param != 0;
+
   // since we compute Jacobians on macro elements, need to adjust the inverse
   // Jacobian by a factor of fe.degree (that says how many subdivisions we
   // make per direction and scales the Jacobian). for JxW, the quadrature
@@ -1805,6 +1822,9 @@ adaflo::NavierStokesPreconditioner<dim>::local_assemble_preconditioner(
                                                        true);
                 }
 
+              const bool     stabilization     = use_stabilization && stab_param != 0;
+              const unsigned d_stab_components = scalar_ilu ? 1 : dim;
+
               // fill matrices with basis function data
               for (unsigned int q = 0; q < n_q_points; ++q)
                 {
@@ -1825,6 +1845,7 @@ adaflo::NavierStokesPreconditioner<dim>::local_assemble_preconditioner(
                     JxW[q] * (parameters.tau_grad_div + actual_nu * tau);
                   const double weight_rho     = JxW[q] * actual_rho;
                   const double weight_damping = JxW[q] * actual_damping;
+                  const double stab_weight_nu = JxW[q] * actual_nu * tau;
 
                   for (unsigned int i = 0; i < dofs_per_u_component; ++i)
                     {
@@ -1862,11 +1883,12 @@ adaflo::NavierStokesPreconditioner<dim>::local_assemble_preconditioner(
                       // weight_rho.
                       phi_and_grad -= weight_damping / weight_rho * phi_iq;
 
+                      double u_grad_phi = 0.;
                       if (linearized != 0)
                         {
                           for (unsigned int d = 0; d < dim; ++d)
-                            phi_and_grad +=
-                              tau * phi_grad_iq[d] * linearized[q].first[d][vec];
+                            u_grad_phi += phi_grad_iq[d] * linearized[q].first[d][vec];
+                          phi_and_grad += tau * u_grad_phi;
                           if (!scalar_ilu)
                             for (unsigned int d = 0; d < dim; ++d)
                               data.velocity_phi_and_grad_matrix((dim + 1) * q + dim,
@@ -1883,6 +1905,35 @@ adaflo::NavierStokesPreconditioner<dim>::local_assemble_preconditioner(
                       if (scalar_ilu)
                         data.velocity_phi_and_grad_matrix((dim + 1) * q + dim, i) =
                           phi_and_grad;
+
+                      if (stabilization)
+                        {
+                          const Tensor<2, dim> &phi_hessian_iq =
+                            data.fe_values_u.shape_hessian(i, q);
+
+                          double laplace_phi = 0.;
+                          for (unsigned int d = 0; d < dim; ++d)
+                            laplace_phi += phi_hessian_iq[d][d];
+
+                          for (unsigned int d = 0; d < d_stab_components; ++d)
+                            {
+                              double dd_phi   = scalar_ilu ? 0. : phi_hessian_iq[d][d];
+                              double conv_phi = data.velocity_phi_and_grad_matrix(
+                                (dim + 1) * q + dim, i * d_stab_components + d);
+
+                              data.stab_prefactor_matrices[d](q, i) =
+                                stab_param[q].first[vec] * u_grad_phi;
+                              if (parameters.convection_stabilization_navier_stokes ==
+                                  FlowParameters::gls)
+                                data.stab_prefactor_matrices[d](q, i) -=
+                                  stab_param[q].first[vec] * actual_nu *
+                                  (laplace_phi + dd_phi);
+
+                              data.stab_strong_res_matrices[d](q, i) =
+                                weight_rho * conv_phi -
+                                stab_weight_nu * (laplace_phi + dd_phi);
+                            }
+                        }
                     }
                 }
 
@@ -1897,6 +1948,30 @@ adaflo::NavierStokesPreconditioner<dim>::local_assemble_preconditioner(
 
               data.velocity_phi_matrix.Tmmult(data.velocity_matrix_permuted,
                                               data.velocity_phi_and_grad_matrix);
+
+              if (stabilization)
+                {
+                  if (scalar_ilu)
+                    data.stab_prefactor_matrices[0].Tmmult(
+                      data.velocity_matrix_permuted,
+                      data.stab_strong_res_matrices[0],
+                      true);
+                  else
+                    {
+                      FullMatrix<double> stab_component_matrix(dofs_per_u_component,
+                                                               dofs_per_u_component);
+                      for (unsigned int d = 0; d < dim; ++d)
+                        {
+                          data.stab_prefactor_matrices[d].Tmmult(
+                            stab_component_matrix, data.stab_strong_res_matrices[d]);
+                          for (unsigned int i = 0; i < dofs_per_u_component; ++i)
+                            for (unsigned int j = 0; j < dofs_per_u_component; ++j)
+                              data.velocity_matrix_permuted(i, j * dim + d) +=
+                                stab_component_matrix(i, j);
+                        }
+                    }
+                }
+
               if (!scalar_ilu)
                 {
                   for (unsigned int i = 0; i < dofs_per_u_component; ++i)
@@ -2356,6 +2431,8 @@ adaflo::NavierStokesPreconditioner<dim>::local_assemble_preconditioner(
         }
       if (linearized != 0)
         linearized += n_q_points;
+      if (stabilization)
+        stab_param += n_q_points;
       if (use_variable_parameters)
         {
           densities += n_q_points;
